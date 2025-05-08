@@ -1,0 +1,186 @@
+ First, here's the `Jenkinsfile`:
+```groovy
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = "your-registry.com"
+        APP_NAME = "sample-app"
+        KUBERNETES_NAMESPACE = "production"
+        DEPLOYMENT_NAME = "sample-app-deployment"
+        GIT_BRANCH = 'main'
+        KUBECONFIG = credentials('kubeconfig-credentials')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        
+        stage('Build and Push Docker Image') {
+            steps {
+                script {
+                    def dockerImage = docker.build("${DOCKER_REGISTRY}/${APP_NAME}:${BUILD_NUMBER}")
+                    docker.withRegistry('https://${DOCKER_REGISTRY}', 'docker-registry-credentials') {
+                        dockerImage.push()
+                        dockerImage.push('latest')
+                    }
+                }
+            }
+        }
+        
+        stage('Update Kubernetes Manifests') {
+            steps {
+                script {
+                    sh """
+                        sed -i 's|image: ${DOCKER_REGISTRY}/${APP_NAME}:.*|image: ${DOCKER_REGISTRY}/${APP_NAME}:${BUILD_NUMBER}|' kubernetes/deployment.yaml
+                    """
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    sh """
+                        export KUBECONFIG=\$KUBECONFIG
+                        kubectl apply -f kubernetes/deployment.yaml
+                        kubectl apply -f kubernetes/service.yaml
+                        kubectl apply -f kubernetes/ingress.yaml
+                        kubectl rollout status deployment/${DEPLOYMENT_NAME} -n ${KUBERNETES_NAMESPACE}
+                    """
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    sh """
+                        export KUBECONFIG=\$KUBECONFIG
+                        kubectl get pods -n ${KUBERNETES_NAMESPACE} | grep ${APP_NAME}
+                        ./scripts/verify-deployment.sh
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        failure {
+            script {
+                sh """
+                    export KUBECONFIG=\$KUBECONFIG
+                    ./scripts/rollback.sh ${DEPLOYMENT_NAME} ${KUBERNETES_NAMESPACE}
+                """
+            }
+        }
+    }
+}
+```
+
+2. Kubernetes deployment manifest (`kubernetes/deployment.yaml`):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app-deployment
+  namespace: production
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: your-registry.com/sample-app:latest
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+```
+
+3. Kubernetes service manifest (`kubernetes/service.yaml`):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  namespace: production
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: sample-app
+```
+
+4. Rollback script (`scripts/rollback.sh`):
+
+```bash
+#!/bin/bash
+
+DEPLOYMENT_NAME=$1
+NAMESPACE=$2
+
+# Get the previous revision
+PREV_REVISION=$(kubectl rollout history deployment/$DEPLOYMENT_NAME -n $NAMESPACE | tail -n 2 | head -n 1 | awk '{print $1}')
+
+if [ -z "$PREV_REVISION" ]; then
+    echo "No previous revision found"
+    exit 1
+fi
+
+# Perform the rollback
+kubectl rollout undo deployment/$DEPLOYMENT_NAME -n $NAMESPACE --to-revision=$PREV_REVISION
+
+# Wait for rollback to complete
+kubectl rollout status deployment/$DEPLOYMENT_NAME -n $NAMESPACE
+
+# Verify the rollback
+kubectl get deployment $DEPLOYMENT_NAME -n $NAMESPACE -o wide
+```
+
+5. Verification script (`scripts/verify-deployment.sh`):
+
+```bash
+#!/bin/bash
+
+# Wait for all pods to be ready
+kubectl wait --for=condition=ready pod -l app=sample-app -n production --timeout=300s
+
+# Check deployment status
+AVAILABLE_REPLICAS=$(kubectl get deployment sample-app-deployment -n production -o jsonpath='{.status.availableReplicas}')
+DESIRED_REPLICAS=$(kubectl get deployment sample-app-deployment -n production -o jsonpath='{.spec.replicas}')
+
+if [ "$AVAILABLE_REPLICAS" -eq "$DESIRED_REPLICAS" ]; then
+    echo "Deployment successful!"
+    exit 0
+else
+    echo "Deployment failed! Available replicas: $AVAILABLE_REPLICAS, Desired replicas: $DESIRED_REPLICAS"
+    exit 1
